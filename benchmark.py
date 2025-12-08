@@ -5,72 +5,92 @@ import pandas as pd
 from PIL import Image
 from torch.nn import functional as F
 
+import os
+os.environ["PYTORCH_SDPA_DISABLE"] = "1"
+
 from transformers import (
     CLIPModel, CLIPProcessor,
     AutoImageProcessor, AutoModelForImageClassification,
     AutoProcessor, AutoModelForVision2Seq,
     AutoFeatureExtractor, AutoModelForAudioClassification,
     AutoModel, AutoTokenizer, AutoModelForSequenceClassification,
+    AutoModelForCausalLM
 )
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 precision = "FP16" if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "FP32"
 
+
 # ===========================================================
-# 공통 유틸
+#  공통 유틸
 # ===========================================================
 
 def measure_ms(fn):
-    start = time.time()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
     out = fn()
-    end = time.time()
-    return out, (end - start) * 1000.0  # ms
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    end = time.perf_counter()
+    return out, (end - start) * 1000.0
+
 
 def get_model_stats(model):
     params = sum(p.numel() for p in model.parameters())
-    # fp32 기준으로 size 계산 (정확한 메모리는 dtype에 따라 변함)
     size_mb = params * 4 / (1024 ** 2)
     return params, size_mb
 
-results = []  # 최종 표용
+
+results = []
 
 
 # ===========================================================
 # 1. IMAGE MODELS
-#   - CLIP: 텍스트 프롬프트와 cosine similarity
-#   - NSFW: normal vs nsfw 확률
-#   - Florence-2: 텍스트 프롬프트 기반 VLM
 # ===========================================================
 
-def benchmark_clip(model_name, image_path, text_prompts):
+def benchmark_clip(model_name, image_path, text_prompts, sample_type="harmful"):
     print(f"\n[IMAGE][CLIP] {model_name}")
 
-    model = CLIPModel.from_pretrained(model_name).to(device)
+    model = CLIPModel.from_pretrained(
+        model_name,
+        use_safetensors=True,
+        revision="main",
+        trust_remote_code=True
+    ).to(device)
+
     processor = CLIPProcessor.from_pretrained(model_name)
 
     params, size_mb = get_model_stats(model)
-
     image = Image.open(image_path).convert("RGB")
 
-    # Preprocessing 측정
+    # Preprocessing
     (_, inputs_ms) = measure_ms(
         lambda: processor(
             text=text_prompts,
             images=image,
-            return_tensors="pt"
-        ).to(device)
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
     )
-    inputs = processor(text=text_prompts, images=image, return_tensors="pt").to(device)
+    inputs = processor(
+        text=text_prompts,
+        images=image,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+    ).to(device)
 
     # Warmup
     for _ in range(3):
         _ = model(**inputs)
 
-    # Inference 측정
+    # Inference
     (outputs, infer_ms) = measure_ms(lambda: model(**inputs))
 
-    # CLIP: 이미지-텍스트 similarity
-    logits_per_image = outputs.logits_per_image  # (batch=1, num_text)
+    # 수정 사항: detach() 추가
+    logits_per_image = outputs.logits_per_image
     probs = logits_per_image.softmax(dim=-1).detach().cpu().numpy()[0]
 
     print("  - Text prompts & probs:")
@@ -92,30 +112,27 @@ def benchmark_clip(model_name, image_path, text_prompts):
         "precision": precision,
         "modality": "image",
         "accuracy": "N/A",
+        "sample_type": sample_type
     })
 
 
-def benchmark_nsfw(model_name, image_path):
+def benchmark_nsfw(model_name, image_path, sample_type="harmful"):
     print(f"\n[IMAGE][NSFW] {model_name}")
 
     image_processor = AutoImageProcessor.from_pretrained(model_name)
     model = AutoModelForImageClassification.from_pretrained(model_name).to(device)
 
     params, size_mb = get_model_stats(model)
-
     image = Image.open(image_path).convert("RGB")
 
-    # Preprocessing
     (_, inputs_ms) = measure_ms(
         lambda: image_processor(images=image, return_tensors="pt").to(device)
     )
     inputs = image_processor(images=image, return_tensors="pt").to(device)
 
-    # Warmup
     for _ in range(3):
         _ = model(**inputs)
 
-    # Inference
     (outputs, infer_ms) = measure_ms(lambda: model(**inputs))
 
     logits = outputs.logits
@@ -125,6 +142,7 @@ def benchmark_nsfw(model_name, image_path):
     print("  - Class probs:")
     for idx, prob in enumerate(probs):
         print(f"    {id2label[idx]}: {prob:.4f}")
+
     nsfw_label = probs.argmax().item()
     print(f"  -> Predicted: {id2label[nsfw_label]}")
 
@@ -141,36 +159,38 @@ def benchmark_nsfw(model_name, image_path):
         "precision": precision,
         "modality": "image",
         "accuracy": "N/A",
+        "sample_type": sample_type
     })
 
 
-def benchmark_florence(model_name, image_path, prompt):
+def benchmark_florence(model_name, image_path, prompt, sample_type="harmful"):
     print(f"\n[IMAGE][Florence-2] {model_name}")
 
-    processor = AutoProcessor.from_pretrained(model_name)
-    model = AutoModelForVision2Seq.from_pretrained(model_name).to(device)
+    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        "microsoft/Florence-2-base",
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        attn_implementation="eager",
+    ).to(device)
 
     params, size_mb = get_model_stats(model)
-
     image = Image.open(image_path).convert("RGB")
 
-    # Preprocessing
-    (_, inputs_ms) = measure_ms(
-        lambda: processor(text=prompt, images=image, return_tensors="pt").to(device)
-    )
-    inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
+    (_, inputs_ms) = measure_ms(lambda: processor(text=prompt, images=image, return_tensors="pt"))
+    inputs = processor(text=prompt, images=image, return_tensors="pt")
 
-    # Warmup
+    inputs["pixel_values"] = inputs["pixel_values"].to(device, dtype=torch.float16)
+    inputs["input_ids"] = inputs["input_ids"].to(device)
+    if "attention_mask" in inputs:
+        inputs["attention_mask"] = inputs["attention_mask"].to(device)
+
     for _ in range(1):
         _ = model.generate(**inputs, max_new_tokens=32)
 
-    # Inference (generate)
-    (generated_ids, infer_ms) = measure_ms(
-        lambda: model.generate(**inputs, max_new_tokens=32)
-    )
+    (_, infer_ms) = measure_ms(lambda: model.generate(**inputs, max_new_tokens=32))
 
-    text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    print(f"  - Prompt: {prompt}")
+    text = processor.batch_decode(_, skip_special_tokens=True)[0]
     print(f"  -> Generated: {text}")
 
     total_ms = inputs_ms + infer_ms
@@ -186,51 +206,52 @@ def benchmark_florence(model_name, image_path, prompt):
         "precision": precision,
         "modality": "image",
         "accuracy": "N/A",
+        "sample_type": sample_type
     })
 
 
 # ===========================================================
 # 2. AUDIO MODELS
-#   - AST / PANNs: 527-class AudioSet 확률
-#   - CLAP: audio-text similarity
 # ===========================================================
 
-def load_audio_waveform(audio_path, target_sr):
-    waveform, sr = torchaudio.load(audio_path)
-    waveform = waveform.squeeze()
+def load_audio_fixed(path, target_sr=16000, min_len=400):
+    waveform, sr = torchaudio.load(path)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
     if sr != target_sr:
-        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
-    return waveform, target_sr
+        waveform = torchaudio.transforms.Resample(sr, target_sr)(waveform)
+        sr = target_sr
+    if waveform.shape[1] < min_len:
+        waveform = torch.nn.functional.pad(waveform, (0, min_len - waveform.shape[1]))
+    return waveform, sr
 
 
-def benchmark_audio_classification(model_name, audio_path, arch_type):
+def load_audio_waveform(path, target_sr):
+    return load_audio_fixed(path, target_sr)
+
+
+def benchmark_audio_classification(model_name, audio_path, arch_type, sample_type="harmful"):
     print(f"\n[AUDIO][CLASSIFICATION] {model_name} ({arch_type})")
 
     extractor = AutoFeatureExtractor.from_pretrained(model_name)
     model = AutoModelForAudioClassification.from_pretrained(model_name).to(device)
 
     params, size_mb = get_model_stats(model)
-
     waveform, sr = load_audio_waveform(audio_path, extractor.sampling_rate)
+    waveform = waveform.squeeze(0)
 
-    # Preprocessing
-    (_, inputs_ms) = measure_ms(
-        lambda: extractor(waveform, sampling_rate=sr, return_tensors="pt").to(device)
-    )
+    (_, inputs_ms) = measure_ms(lambda: extractor(waveform, sampling_rate=sr, return_tensors="pt").to(device))
     inputs = extractor(waveform, sampling_rate=sr, return_tensors="pt").to(device)
 
-    # Warmup
     for _ in range(3):
         _ = model(**inputs)
 
-    # Inference
     (outputs, infer_ms) = measure_ms(lambda: model(**inputs))
 
     logits = outputs.logits
     probs = F.softmax(logits, dim=-1).detach().cpu()[0]
     id2label = model.config.id2label
 
-    # top-5 label 출력
     topk = torch.topk(probs, k=min(5, probs.shape[0]))
     print("  - Top classes:")
     for score, idx in zip(topk.values, topk.indices):
@@ -249,10 +270,11 @@ def benchmark_audio_classification(model_name, audio_path, arch_type):
         "precision": precision,
         "modality": "audio",
         "accuracy": "N/A",
+        "sample_type": sample_type
     })
 
 
-def benchmark_clap(model_name, audio_path, candidate_labels):
+def benchmark_clap(model_name, audio_path, candidate_labels, sample_type="harmful"):
     print(f"\n[AUDIO][CLAP] {model_name} (Dual-encoder)")
 
     processor = AutoProcessor.from_pretrained(model_name)
@@ -260,45 +282,29 @@ def benchmark_clap(model_name, audio_path, candidate_labels):
 
     params, size_mb = get_model_stats(model)
 
-    # Audio load
-    dummy_sr = 48000  # CLAP processor가 내부적으로 맞춰줌
     waveform, _ = torchaudio.load(audio_path)
-    waveform = waveform.mean(dim=0)  # mono
+    waveform = waveform.mean(dim=0)
 
-    # Preprocessing (audio + text 둘 다)
     (_, inputs_ms) = measure_ms(
-        lambda: processor(
-            audios=waveform,
-            text=candidate_labels,
-            return_tensors="pt",
-            padding=True
-        ).to(device)
+        lambda: processor(audios=waveform, text=candidate_labels,
+                          return_tensors="pt", padding=True).to(device)
     )
-    inputs = processor(
-        audios=waveform,
-        text=candidate_labels,
-        return_tensors="pt",
-        padding=True
-    ).to(device)
+    inputs = processor(audios=waveform, text=candidate_labels,
+                       return_tensors="pt", padding=True).to(device)
 
-    # Warmup
     for _ in range(1):
         _ = model(**inputs)
 
-    # Inference
     (outputs, infer_ms) = measure_ms(lambda: model(**inputs))
 
-    # CLAP outputs: audio_embeds, text_embeds (모델에 따라 다를 수 있음)
-    audio_embeds = outputs.audio_embeds  # (1, d)
-    text_embeds = outputs.text_embeds    # (num_labels, d)
-
-    audio_embeds = F.normalize(audio_embeds, dim=-1)
-    text_embeds = F.normalize(text_embeds, dim=-1)
+    audio_embeds = F.normalize(outputs.audio_embeds, dim=-1)
+    text_embeds = F.normalize(outputs.text_embeds, dim=-1)
     sims = (audio_embeds @ text_embeds.T).squeeze(0).detach().cpu()
 
     print("  - Candidate label similarities:")
     for lbl, s in zip(candidate_labels, sims):
         print(f"    {lbl}: {s.item():.4f}")
+
     top_idx = torch.argmax(sims).item()
     print(f"  -> Predicted label: {candidate_labels[top_idx]}")
 
@@ -315,15 +321,64 @@ def benchmark_clap(model_name, audio_path, candidate_labels):
         "precision": precision,
         "modality": "audio",
         "accuracy": "N/A",
+        "sample_type": sample_type
+    })
+
+
+from panns_inference import AudioTagging
+
+def benchmark_audio_panns(model_name, audio_path, sample_type="harmful"):
+    print(f"\n[AUDIO][PANNs] {model_name} (CNN14)")
+
+    (_, load_ms) = measure_ms(lambda: AudioTagging(checkpoint_path=None))
+    at_model = AudioTagging(checkpoint_path=None)
+
+    params = 79_000_000
+    size_mb = 300
+
+    waveform, sr = torchaudio.load(audio_path)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+
+    wav_np = waveform.squeeze(0).cpu().numpy()
+    if wav_np.ndim == 1:
+        wav_np = wav_np[None, :]
+
+    (out, infer_ms) = measure_ms(lambda: at_model.inference(wav_np))
+
+    clipwise_output, embedding = out
+    clipwise_output = clipwise_output.squeeze()
+    labels = at_model.labels
+
+    top5_idx = clipwise_output.argsort()[-5:][::-1]
+
+    print("  - Top classes:")
+    for idx in top5_idx:
+        print(f"    {labels[idx]}: {clipwise_output[idx]:.4f}")
+
+    total_ms = load_ms + infer_ms
+
+    results.append({
+        "model_name": model_name,
+        "architecture_type": "CNN (PANNs-Cnn14)",
+        "parameter_count": params,
+        "model_size_MB": size_mb,
+        "preprocessing_cost_ms": load_ms,
+        "inference_latency_ms": infer_ms,
+        "total_latency_ms": total_ms,
+        "device": device,
+        "precision": "FP32",
+        "modality": "audio",
+        "accuracy": "N/A",
+        "sample_type": sample_type
     })
 
 
 # ===========================================================
 # 3. TEXT MODELS
-#   - Toxic-BERT / Toxic-RoBERTa: toxicity scores
 # ===========================================================
 
-def benchmark_text_toxicity(model_name, text_path):
+def benchmark_text_toxicity(model_name, text_path, sample_type="harmful"):
     print(f"\n[TEXT][TOXICITY] {model_name}")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -334,21 +389,17 @@ def benchmark_text_toxicity(model_name, text_path):
     with open(text_path, "r", encoding="utf-8") as f:
         text = f.read().strip()
 
-    # Preprocessing
     (_, inputs_ms) = measure_ms(
         lambda: tokenizer(text, return_tensors="pt", truncation=True).to(device)
     )
     inputs = tokenizer(text, return_tensors="pt", truncation=True).to(device)
 
-    # Warmup
     for _ in range(3):
         _ = model(**inputs)
 
-    # Inference
     (outputs, infer_ms) = measure_ms(lambda: model(**inputs))
 
     logits = outputs.logits.detach().cpu()[0]
-    # multi-label일 수도, softmax single-label일 수도 있어서 둘 다 커버
     if model.config.problem_type == "multi_label_classification":
         probs = torch.sigmoid(logits)
     else:
@@ -356,11 +407,13 @@ def benchmark_text_toxicity(model_name, text_path):
 
     id2label = model.config.id2label
     topk = torch.topk(probs, k=min(5, probs.shape[0]))
+
     print("  - Toxicity scores:")
     for score, idx in zip(topk.values, topk.indices):
         print(f"    {id2label[idx.item()]}: {score.item():.4f}")
 
     total_ms = inputs_ms + infer_ms
+
     results.append({
         "model_name": model_name,
         "architecture_type": "Transformer",
@@ -373,58 +426,64 @@ def benchmark_text_toxicity(model_name, text_path):
         "precision": precision,
         "modality": "text",
         "accuracy": "N/A",
+        "sample_type": sample_type
     })
 
 
 # ===========================================================
-# MAIN
+# MAIN LOOP
 # ===========================================================
 
 if __name__ == "__main__":
-    harmful_image = "images/harmful.jpg"
-    harmful_audio = "audio/harmful.wav"
-    harmful_text = "text/harmful.txt"
 
-    # 1. FRAME / IMAGE MODELS
+    datasets = {
+        "harmful": {
+            "image": "images/harmful.jpg",
+            "audio": "audio/harmful.wav",
+            "text":  "text/harmful.txt",
+        },
+        "normal": {
+            "image": "images/normal.jpg",
+            "audio": "audio/normal.wav",
+            "text":  "text/normal.txt",
+        }
+    }
+
     clip_prompts = ["a knife", "blood", "fighting", "a peaceful scene"]
+    clap_labels = ["scream", "crying", "explosion", "gunshot", "music", "kitten"]
     florence_prompt = "Describe any violence, weapons, or injuries in this image."
 
-    benchmark_clip("openai/clip-vit-base-patch32", harmful_image, clip_prompts)
-    benchmark_clip("openai/clip-vit-large-patch14", harmful_image, clip_prompts)
+    for sample_type, paths in datasets.items():
 
-    benchmark_nsfw("Falconsai/nsfw_image_detection", harmful_image)
+        print(f"\n\n========== Running benchmarks for {sample_type.upper()} data ==========\n")
 
-    benchmark_florence("microsoft/Florence-2-base", harmful_image, florence_prompt)
-    benchmark_florence("microsoft/Florence-2-large", harmful_image, florence_prompt)
+        img_path = paths["image"]
+        aud_path = paths["audio"]
+        txt_path = paths["text"]
 
-    # 2. AUDIO MODELS
-    # AST (Transformer)
-    benchmark_audio_classification(
-        "MIT/ast-finetuned-audioset-10-10-0.4593",
-        harmful_audio,
-        arch_type="Transformer"
-    )
+        benchmark_clip("openai/clip-vit-base-patch32", img_path, clip_prompts, sample_type)
+        benchmark_clip("openai/clip-vit-large-patch14", img_path, clip_prompts, sample_type)
+        benchmark_nsfw("Falconsai/nsfw_image_detection", img_path, sample_type)
 
-    # PANNs (CNN) - 실제 허깅페이스 모델 이름은 환경에 맞게 조정 필요
-    benchmark_audio_classification(
-        "qiuqiangkong/panns_cnn14",
-        harmful_audio,
-        arch_type="CNN"
-    )
+        benchmark_audio_classification(
+            "MIT/ast-finetuned-audioset-10-10-0.4593",
+            aud_path,
+            arch_type="Transformer",
+            sample_type=sample_type
+        )
 
-    # CLAP (Dual-encoder)
-    clap_labels = ["scream", "crying", "explosion", "gunshot", "music"]
-    benchmark_clap(
-        "laion/clap-htsat-unfused",
-        harmful_audio,
-        candidate_labels=clap_labels
-    )
+        benchmark_audio_panns("PANNs-Cnn14", aud_path, sample_type)
 
-    # 3. TEXT MODELS
-    benchmark_text_toxicity("unitary/unbiased-toxic-roberta", harmful_text)
-    benchmark_text_toxicity("unitary/toxic-bert", harmful_text)
+        benchmark_clap(
+            "laion/clap-htsat-unfused",
+            aud_path,
+            candidate_labels=clap_labels,
+            sample_type=sample_type
+        )
 
-    # 4. 결과 표 출력
+        benchmark_text_toxicity("unitary/unbiased-toxic-roberta", txt_path, sample_type)
+        benchmark_text_toxicity("unitary/toxic-bert", txt_path, sample_type)
+
     df = pd.DataFrame(results, columns=[
         "model_name",
         "architecture_type",
@@ -437,6 +496,7 @@ if __name__ == "__main__":
         "precision",
         "modality",
         "accuracy",
+        "sample_type"
     ])
 
     print("\n\n========== BENCHMARK SUMMARY ==========\n")
